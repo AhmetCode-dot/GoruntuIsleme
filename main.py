@@ -11,7 +11,6 @@ import numpy as np
 import math
 import os
 from skimage.restoration import richardson_lucy, unsupervised_wiener
-import pandas as pd
 
 # Global stil tanımlamaları
 STYLE_SHEET = """
@@ -892,8 +891,7 @@ class FinalProjectWindow(QMainWindow):
             "Özel Fonksiyon",
             "Yol Çizgisi Tespiti",
             "Göz Tespiti",
-            "Koyu Yeşil Bölge Analizi (Excel Çıktısı)",
-            "Deblur"
+            "Deblurring (Richardson-Lucy)"
         ])
         control_layout.addWidget(self.operation_combo)
         
@@ -956,7 +954,7 @@ class FinalProjectWindow(QMainWindow):
         is_sigmoid = operation in ["Standart Sigmoid", "Yatay Kaydırılmış Sigmoid", "Eğimli Sigmoid", "Özel Fonksiyon"]
         self.alpha_spin.setVisible(is_sigmoid)
         self.beta_spin.setVisible(operation in ["Yatay Kaydırılmış Sigmoid", "Eğimli Sigmoid"])
-        is_deblur = operation in ["Deblur"]
+        is_deblur = operation in ["Deblurring (Richardson-Lucy)"]
         self.kernel_size_spin.setVisible(is_deblur)
         self.angle_spin.setVisible(is_deblur)
 
@@ -1017,13 +1015,13 @@ class FinalProjectWindow(QMainWindow):
                 self.processed_image = self.detect_road_lines(self.current_image)
             elif operation == "Göz Tespiti":
                 self.processed_image = self.detect_eyes(self.current_image)
-            elif operation == "Koyu Yeşil Bölge Analizi (Excel Çıktısı)":
-                self.processed_image = self.analyze_dark_green_regions(self.current_image)
-            elif operation == "Deblur":
+            elif operation == "Deblurring (Richardson-Lucy)":
                 kernel_size = self.kernel_size_spin.value()
                 angle = self.angle_spin.value()
-                self.processed_image = self.advanced_unsharp_deblurring(self.current_image, kernel_size, angle, amount=2.5, color_boost=1.15)
+                self.processed_image = self.richardson_lucy_deblurring(self.current_image, kernel_size, angle)
+            
             self.display_image(self.processed_image, self.processed_frame.image_label)
+            
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"İşlem sırasında bir hata oluştu: {str(e)}")
 
@@ -1142,86 +1140,42 @@ class FinalProjectWindow(QMainWindow):
             QMessageBox.critical(self, "Hata", f"Göz tespiti sırasında bir hata oluştu: {str(e)}")
             return image
 
-    def analyze_dark_green_regions(self, image):
-        # 1. Görüntüyü HSV'ye çevir
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        # 2. Koyu yeşil için maske oluştur (HSV aralığı ayarlanabilir)
-        lower = np.array([35, 40, 20])
-        upper = np.array([85, 255, 120])
-        mask = cv2.inRange(hsv, lower, upper)
-        # 3. Bağlı bileşenleri bul
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        results = []
-        # İşlenmiş görüntü için kopya oluştur
-        result_img = image.copy()
-        for i in range(1, num_labels):  # 0 arka plan
-            x, y, w, h, area = stats[i]
-            if area < 10:  # çok küçük bölgeleri atla
-                continue
-            region_mask = (labels == i)
-            region_pixels = image[region_mask]
-            gray_pixels = cv2.cvtColor(region_pixels.reshape(-1,1,3), cv2.COLOR_BGR2GRAY).flatten()
-            # Özellikler
-            center = tuple(map(int, centroids[i]))
-            length, width = w, h
-            diagonal = int(np.sqrt(w**2 + h**2))
-            energy = np.sum(gray_pixels.astype(np.float32)**2) / 1e4  # ölçekli
-            p = np.histogram(gray_pixels, bins=256, range=(0,255))[0]/len(gray_pixels)
-            entropy = -np.sum(p * np.log2(p+1e-8))
-            mean = int(np.mean(gray_pixels))
-            median = int(np.median(gray_pixels))
-            results.append([len(results)+1, f"{center[0]},{center[1]}", f"{length} px", f"{width} px", f"{diagonal} px", round(energy,3), round(entropy,2), mean, median])
-            # İşlenmiş görüntüde bölgeyi vurgula (ör: kontur veya renk)
-            # Kontur için maske oluştur
-            region_uint8 = region_mask.astype(np.uint8) * 255
-            contours, _ = cv2.findContours(region_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(result_img, contours, -1, (0,0,255), 2)  # Kırmızı kontur
-        # 4. Excel'e yaz
-        df = pd.DataFrame(results, columns=["No","Center","Length","Width","Diagonal","Energy","Entropy","Mean","Median"])
-        file_name, _ = QFileDialog.getSaveFileName(self, "Excel Olarak Kaydet", "", "Excel Files (*.xlsx)")
-        if file_name:
-            df.to_excel(file_name, index=False)
-        return result_img  # İşlenmiş görüntüde bölgeler vurgulanmış şekilde gösterilecek
-
-    def advanced_unsharp_deblurring(self, image, kernel_size=15, angle=0, amount=2.5, color_boost=1.15):
-        # Renkli çalış: Her kanal için uygula
-        channels = cv2.split(image)
-        result_channels = []
-        h, w = channels[0].shape
-
-        def motion_blur_psf(length, angle):
-            psf = np.zeros((length, length))
+    def richardson_lucy_deblurring(self, image, kernel_size, angle):
+        # Kullanıcıya kernel boyutu hakkında uyarı
+        if kernel_size < 3 or kernel_size > 51:
+            QMessageBox.warning(self, "Uyarı", "Kernel boyutu 3 ile 51 arasında olmalıdır.")
+            return image
+        # Hareket bulanıklığı için kernel oluştur
+        def motion_blur_kernel(length, angle):
+            kernel = np.zeros((length, length))
             center = length // 2
             rad = np.deg2rad(angle)
+            cos_a = np.cos(rad)
+            sin_a = np.sin(rad)
             for i in range(length):
-                x = int(center + (i - center) * np.cos(rad))
-                y = int(center + (i - center) * np.sin(rad))
+                x = int(center + (i - center) * cos_a)
+                y = int(center + (i - center) * sin_a)
                 if 0 <= x < length and 0 <= y < length:
-                    psf[y, x] = 1
-            psf /= psf.sum()
-            return psf
+                    kernel[y, x] = 1
+            kernel = kernel / (np.sum(kernel) + 1e-8)  # Sıfır bölmeye karşı koruma
+            kernel = np.clip(kernel, 1e-8, None)  # Sıfır değerleri engelle
+            return kernel
+        kernel = motion_blur_kernel(kernel_size, angle)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Richardson-Lucy iterasyonları (ör: 20)
+        deblurred = richardson_lucy(gray.astype(np.float32)/255.0, kernel, num_iter=20)
+        deblurred = np.clip(deblurred * 255, 0, 255).astype(np.uint8)
+        
+        return deblurred
 
-        psf = motion_blur_psf(kernel_size, angle)
-        psf_padded = np.zeros((h, w), dtype=np.float32)
-        kh, kw = psf.shape
-        y0 = (h - kh) // 2
-        x0 = (w - kw) // 2
-        psf_padded[y0:y0+kh, x0:x0+kw] = psf
-
-        for ch in channels:
-            blurred = cv2.filter2D(ch.astype(np.float32), -1, psf_padded)
-            details = ch.astype(np.float32) - blurred
-            sharpened = ch.astype(np.float32) + amount * details
-            sharpened = np.clip(sharpened, 0, 255)
-            result_channels.append(sharpened.astype(np.uint8))
-
-        sharpened_bgr = cv2.merge(result_channels)
-        # Renk doygunluğunu artırmak için HSV'ye çevirip S kanalını güçlendir
-        hsv = cv2.cvtColor(sharpened_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[...,1] = np.clip(hsv[...,1] * color_boost, 0, 255)
-        hsv[...,2] = np.clip(hsv[...,2], 0, 255)
-        colored = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-        return colored
+    def unsupervised_wiener_deblurring(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        psf = np.ones((5, 5)) / 25  # Basit bir başlangıç çekirdeği
+        deconvolved, _ = unsupervised_wiener(gray.astype(np.float32)/255.0, psf)
+        deconvolved = np.clip(deconvolved * 255, 0, 255).astype(np.uint8)
+        
+        
+        return deconvolved
 
     def save_image(self):
         if self.processed_image is not None:
